@@ -113,6 +113,23 @@
       cursor: pointer; pointer-events: all;
       backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
     }
+    #hud-debug-btn {
+      position: absolute; top: 100px; right: 16px;
+      background: rgba(0,0,0,0.65); border: 1px solid rgba(255,200,0,0.4);
+      color: #ffc800; padding: 6px 12px; border-radius: 20px; font-size: 12px;
+      cursor: pointer; pointer-events: all;
+      backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
+    }
+    #debug-panel {
+      display: none;
+      position: absolute; top: 0; left: 0; right: 0;
+      background: rgba(0,0,0,0.85);
+      color: #ffc800; font-size: 11px; font-family: monospace;
+      padding: 10px 12px; line-height: 1.7;
+      pointer-events: none;
+      white-space: pre;
+      max-height: 55vh; overflow-y: auto;
+    }
 
     /* Off-screen edge arrows */
     .edge-indicator {
@@ -164,6 +181,8 @@
   <button id="hud-back" onclick="stopAR()">← Back</button>
   <div id="hud-compass">↑ ---°</div>
   <button id="hud-flip" onclick="flipCompass()">↔ Flip compass</button>
+  <button id="hud-debug-btn" onclick="toggleDebug()">🔍 Debug</button>
+  <div id="debug-panel"></div>
   <div id="hud-status">Acquiring GPS…</div>
 </div>
 
@@ -183,8 +202,19 @@ let firstHeading = true;        // snap smoothHeading on the very first reading
 // "Flip compass" toggles between the two. Preference is saved across sessions.
 let alphaFlipped = localStorage.getItem('compassFlip') === '1';
 
-const HFOV = 62;  // horizontal field of view (degrees) — typical wide-angle phone camera
-const VFOV = 48;  // vertical field of view (degrees) — portrait mode
+// Debug state — updated on every orientation event for display
+let dbg = {
+  source:    'none',   // which event last fired
+  rawAlpha:  null,     // alpha straight from the event
+  rawBeta:   null,     // beta straight from the event
+  eventCount: 0,       // total orientation events received
+  absCount:   0,       // deviceorientationabsolute count
+  fallCount:  0,       // deviceorientation count
+};
+let debugVisible = false;
+
+const HFOV = 80;  // horizontal field of view (degrees) — wider margin for compass error
+const VFOV = 60;  // vertical field of view (degrees) — portrait mode
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 const toRad = d => d * Math.PI / 180;
@@ -344,9 +374,7 @@ function stopAR() {
 }
 
 // ── Orientation ────────────────────────────────────────────────────────────
-function applyAlpha(alpha) {
-  // alpha from deviceorientationabsolute on Android: CW or CCW from North depends on device.
-  // "Flip compass" lets the user toggle between the two interpretations.
+function setHeadingFromAlpha(alpha) {
   rawHeading = alphaFlipped ? (360 - alpha) % 360 : alpha;
   if (firstHeading) { smoothHeading = rawHeading; firstHeading = false; }
   hasAbsoluteHeading = true;
@@ -355,28 +383,45 @@ function applyAlpha(alpha) {
 function flipCompass() {
   alphaFlipped = !alphaFlipped;
   localStorage.setItem('compassFlip', alphaFlipped ? '1' : '0');
-  // Snap smoothHeading immediately so the user sees the effect right away.
-  smoothHeading = rawHeading;
+  smoothHeading = rawHeading; // snap immediately so the user sees the effect
+}
+
+function toggleDebug() {
+  debugVisible = !debugVisible;
+  document.getElementById('debug-panel').style.display = debugVisible ? 'block' : 'none';
 }
 
 function onOrientationAbsolute(e) {
-  if (e.beta != null) pitch = e.beta - 90; // 0 = pointing at horizon, + = tilted down
-  if (e.alpha != null) applyAlpha(e.alpha);
+  dbg.absCount++;
+  dbg.eventCount++;
+  dbg.source   = 'deviceorientationabsolute';
+  dbg.rawAlpha = e.alpha;
+  dbg.rawBeta  = e.beta;
+  if (e.beta  != null) pitch = e.beta - 90;
+  if (e.alpha != null) setHeadingFromAlpha(e.alpha);
 }
 
 function onOrientationFallback(e) {
-  // Always update pitch, even after heading source is established.
+  dbg.fallCount++;
+  dbg.eventCount++;
+  dbg.rawBeta = e.beta;
   if (e.beta != null) pitch = e.beta - 90;
-  if (hasAbsoluteHeading) return; // heading already handled by deviceorientationabsolute
+
   if (e.webkitCompassHeading != null) {
-    // iOS: webkitCompassHeading is always CW-from-North — no flip needed.
+    dbg.source   = 'deviceorientation[webkitCompassHeading]';
+    dbg.rawAlpha = e.webkitCompassHeading;
     rawHeading = e.webkitCompassHeading;
     if (firstHeading) { smoothHeading = rawHeading; firstHeading = false; }
     hasAbsoluteHeading = true;
   } else if (e.absolute && e.alpha != null) {
-    applyAlpha(e.alpha);
+    dbg.source   = 'deviceorientation[absolute=true]';
+    dbg.rawAlpha = e.alpha;
+    setHeadingFromAlpha(e.alpha);
+  } else {
+    // Non-absolute — records event count but doesn't update heading.
+    dbg.source   = `deviceorientation[absolute=${e.absolute}, alpha=${e.alpha != null}]`;
+    dbg.rawAlpha = e.alpha;
   }
-  // Non-absolute alpha (relative to device start) is useless for AR — skip it.
 }
 
 // ── Render loop ────────────────────────────────────────────────────────────
@@ -398,6 +443,7 @@ function renderLoop() {
     : `↑ No compass${gpsTag}`;
 
   let inRangeCount = 0;
+  const stationDebugLines = [];
 
   stations.forEach(s => {
     const marker  = document.getElementById(`m-${s.id}`);
@@ -412,6 +458,7 @@ function renderLoop() {
     if (dist > 100) {
       marker.style.display = 'none';
       if (edgeEl) edgeEl.style.display = 'none';
+      stationDebugLines.push(`  "${s.name}": ${Math.round(dist)}m — OUT OF RANGE`);
       return;
     }
     inRangeCount++;
@@ -430,6 +477,11 @@ function renderLoop() {
     const yPct = 50 - (relV / (VFOV / 2)) * 50;
 
     const inView = Math.abs(relH) < HFOV / 2;
+
+    const visLabel = inView ? 'VISIBLE' : (relH < 0 ? 'LEFT' : 'RIGHT');
+    stationDebugLines.push(
+      `  "${s.name}": dist=${Math.round(dist)}m bear=${Math.round(bearing)}° relH=${relH > 0 ? '+' : ''}${Math.round(relH)}° → ${visLabel}`
+    );
 
     if (inView) {
       marker.style.display = 'flex';
@@ -450,6 +502,34 @@ function renderLoop() {
       edgeEl.style.display = 'block';
     }
   });
+
+  // Debug panel
+  if (debugVisible) {
+    const gps = userPos
+      ? `${userPos.lat.toFixed(6)}, ${userPos.lon.toFixed(6)}`
+      : 'waiting…';
+    const gpsAcc = document.getElementById('hud-compass').dataset.gps || '?';
+    document.getElementById('debug-panel').textContent =
+`── SENSOR SOURCE ──────────────────────────
+source   : ${dbg.source}
+events   : total=${dbg.eventCount}  abs=${dbg.absCount}  fallback=${dbg.fallCount}
+rawAlpha : ${dbg.rawAlpha != null ? dbg.rawAlpha.toFixed(2) + '°' : 'null'}
+rawBeta  : ${dbg.rawBeta  != null ? dbg.rawBeta.toFixed(2)  + '°' : 'null'}
+flip     : ${alphaFlipped ? 'ON (using 360−alpha)' : 'OFF (using alpha directly)'}
+hasAbs   : ${hasAbsoluteHeading}
+
+── HEADING ────────────────────────────────
+rawHeading    : ${rawHeading.toFixed(1)}°
+smoothHeading : ${smoothHeading.toFixed(1)}°
+pitch         : ${pitch.toFixed(1)}°   (0=horizon +tilted-down)
+
+── GPS ────────────────────────────────────
+position : ${gps}
+accuracy : ${gpsAcc}
+
+── STATIONS (FOV ±${HFOV/2}°) ─────────────
+${stationDebugLines.join('\n') || '  (none in range)'}`;
+  }
 
   // Status line
   const statusEl = document.getElementById('hud-status');
