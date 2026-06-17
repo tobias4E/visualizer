@@ -161,8 +161,11 @@
     <label>Coordinates (WGS84)</label>
     <div class="row">
       <input id="inp-lat" placeholder="Latitude" type="number" step="any" enterkeyhint="next">
-      <input id="inp-lon" placeholder="Longitude" type="number" step="any" enterkeyhint="done">
+      <input id="inp-lon" placeholder="Longitude" type="number" step="any" enterkeyhint="next">
     </div>
+
+    <label>Height above ground (m) — optional, e.g. 1.0 for a charging post top</label>
+    <input id="inp-height" placeholder="Height in m (default 1.0)" type="number" step="0.1" min="0" max="50" enterkeyhint="done">
 
     <button class="btn btn-add" onclick="addStation()">+ Add Station</button>
   </div>
@@ -192,7 +195,8 @@ let stations = JSON.parse(localStorage.getItem('stations') || '[]');
 let userPos  = null;
 let rawHeading    = 0;  // latest compass reading (CW from north)
 let smoothHeading = 0;  // exponentially smoothed heading used for rendering
-let pitch    = 0;   // device tilt: 0 = pointing at horizon, + = looking down
+let rawPitch    = 0;    // latest tilt reading:  0 = pointing at horizon, + = looking down
+let smoothPitch = 0;    // exponentially smoothed pitch used for rendering
 let stream   = null;
 let watchId  = null;
 let rafId    = null;
@@ -246,19 +250,22 @@ function saveStations() {
 }
 
 function addStation() {
-  const name = document.getElementById('inp-name').value.trim();
-  const lat  = parseFloat(document.getElementById('inp-lat').value);
-  const lon  = parseFloat(document.getElementById('inp-lon').value);
+  const name   = document.getElementById('inp-name').value.trim();
+  const lat    = parseFloat(document.getElementById('inp-lat').value);
+  const lon    = parseFloat(document.getElementById('inp-lon').value);
+  const hRaw   = parseFloat(document.getElementById('inp-height').value);
+  const height = isNaN(hRaw) ? 1.0 : Math.max(0, hRaw); // default 1.0 m
 
-  if (!name)                              return alert('Please enter a station name.');
-  if (isNaN(lat) || lat < -90 || lat > 90)  return alert('Latitude must be between −90 and 90.');
+  if (!name)                               return alert('Please enter a station name.');
+  if (isNaN(lat) || lat < -90 || lat > 90)   return alert('Latitude must be between −90 and 90.');
   if (isNaN(lon) || lon < -180 || lon > 180) return alert('Longitude must be between −180 and 180.');
 
-  stations.push({ id: Date.now(), name, lat, lon });
+  stations.push({ id: Date.now(), name, lat, lon, height });
   saveStations();
-  document.getElementById('inp-name').value = '';
-  document.getElementById('inp-lat').value  = '';
-  document.getElementById('inp-lon').value  = '';
+  document.getElementById('inp-name').value   = '';
+  document.getElementById('inp-lat').value    = '';
+  document.getElementById('inp-lon').value    = '';
+  document.getElementById('inp-height').value = '';
   document.getElementById('inp-name').focus();
   renderList();
 }
@@ -278,7 +285,7 @@ function renderList() {
       <div class="station-item">
         <div class="info">
           <div class="sname">${escHtml(s.name)}</div>
-          <div class="scoords">${s.lat.toFixed(6)}, ${s.lon.toFixed(6)}</div>
+          <div class="scoords">${s.lat.toFixed(6)}, ${s.lon.toFixed(6)} · ${(s.height ?? 1.0).toFixed(1)} m</div>
         </div>
         <button class="btn-del" onclick="removeStation(${s.id})" title="Remove">✕</button>
       </div>
@@ -397,7 +404,7 @@ function onOrientationAbsolute(e) {
   dbg.source   = 'deviceorientationabsolute';
   dbg.rawAlpha = e.alpha;
   dbg.rawBeta  = e.beta;
-  if (e.beta  != null) pitch = e.beta - 90;
+  if (e.beta  != null) rawPitch = e.beta - 90; // 0 = pointing at horizon, + = tilted down
   if (e.alpha != null) setHeadingFromAlpha(e.alpha);
 }
 
@@ -405,7 +412,7 @@ function onOrientationFallback(e) {
   dbg.fallCount++;
   dbg.eventCount++;
   dbg.rawBeta = e.beta;
-  if (e.beta != null) pitch = e.beta - 90;
+  if (e.beta != null) rawPitch = e.beta - 90;
 
   if (e.webkitCompassHeading != null) {
     dbg.source   = 'deviceorientation[webkitCompassHeading]';
@@ -429,12 +436,12 @@ function renderLoop() {
   rafId = requestAnimationFrame(renderLoop);
   if (!userPos) return;
 
-  // Smooth heading with circular exponential moving average to reduce compass jitter.
-  // Factor 0.15 = responsive but stable (~6–7 frames to settle).
+  // Smooth heading (circular EMA). Pitch is tracked but not used for rendering.
   let diff = rawHeading - smoothHeading;
   if (diff >  180) diff -= 360;
   if (diff < -180) diff += 360;
   smoothHeading = (smoothHeading + diff * 0.15 + 360) % 360;
+  smoothPitch   = smoothPitch + (rawPitch - smoothPitch) * 0.1; // kept for debug only
 
   const compassEl = document.getElementById('hud-compass');
   const gpsTag = compassEl.dataset.gps ? ` GPS${compassEl.dataset.gps}` : '';
@@ -468,10 +475,19 @@ function renderLoop() {
     // Horizontal: bearing relative to smoothed device heading (−180 to +180)
     const relH = ((bearing - smoothHeading + 540) % 360) - 180;
 
-    // Vertical: ground-level targets sit slightly below the horizon for nearby points.
-    // elevAngle < 0 means below horizon; for far targets it approaches 0.
-    const elevAngle = dist > 5 ? -toDeg(Math.atan(1.5 / dist)) : -8;
-    const relV = elevAngle + pitch; // pitch > 0 = looking down → horizon rises in frame
+    // Vertical: place the arrow at the geometrically correct elevation angle for this
+    // distance and height, but deliberately ignore device pitch (tilt sensor).
+    // Reason: pitch from the gyro is noisy and inconsistent across devices, causing the
+    // arrow to wobble when the hand trembles. For a ground-level target the correct
+    // elevation is always close to the horizon; basing Y on distance alone is stable
+    // and accurate enough for practical use.
+    const EYE_HEIGHT = 1.6;
+    const stationH   = s.height ?? 1.0;
+    const heightDiff = EYE_HEIGHT - stationH; // positive = station is below eye
+    const elevAngle  = -toDeg(Math.atan2(heightDiff, Math.max(dist, 0.5)));
+    // Map elevation angle to screen Y with a fixed reference VFOV (no pitch term).
+    // yPct 50 = horizon, >50 = below horizon (lower on screen).
+    const relV = elevAngle; // no smoothPitch — vertical is world-geometry only
 
     const xPct = 50 + (relH / (HFOV / 2)) * 50;
     const yPct = 50 - (relV / (VFOV / 2)) * 50;
@@ -479,8 +495,10 @@ function renderLoop() {
     const inView = Math.abs(relH) < HFOV / 2;
 
     const visLabel = inView ? 'VISIBLE' : (relH < 0 ? 'LEFT' : 'RIGHT');
+    const EYE_HEIGHT2 = 1.6;
+    const elev = -toDeg(Math.atan2(EYE_HEIGHT2 - (s.height ?? 1.0), Math.max(dist, 0.5)));
     stationDebugLines.push(
-      `  "${s.name}": dist=${Math.round(dist)}m bear=${Math.round(bearing)}° relH=${relH > 0 ? '+' : ''}${Math.round(relH)}° → ${visLabel}`
+      `  "${s.name}": dist=${Math.round(dist)}m bear=${Math.round(bearing)}° relH=${relH > 0 ? '+' : ''}${Math.round(relH)}° elev=${elev.toFixed(1)}° h=${(s.height ?? 1.0).toFixed(1)}m → ${visLabel}`
     );
 
     if (inView) {
@@ -521,7 +539,8 @@ hasAbs   : ${hasAbsoluteHeading}
 ── HEADING ────────────────────────────────
 rawHeading    : ${rawHeading.toFixed(1)}°
 smoothHeading : ${smoothHeading.toFixed(1)}°
-pitch         : ${pitch.toFixed(1)}°   (0=horizon +tilted-down)
+rawPitch      : ${rawPitch.toFixed(1)}°   (0=horizon +tilted-down)
+smoothPitch   : ${smoothPitch.toFixed(1)}°
 
 ── GPS ────────────────────────────────────
 position : ${gps}
