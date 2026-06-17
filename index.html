@@ -106,6 +106,13 @@
       font-size: 12px; pointer-events: none;
       text-shadow: 0 1px 3px rgba(0,0,0,0.9);
     }
+    #hud-flip {
+      position: absolute; top: 58px; right: 16px;
+      background: rgba(0,0,0,0.65); border: 1px solid rgba(88,166,255,0.4);
+      color: #58a6ff; padding: 6px 12px; border-radius: 20px; font-size: 12px;
+      cursor: pointer; pointer-events: all;
+      backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
+    }
 
     /* Off-screen edge arrows */
     .edge-indicator {
@@ -156,6 +163,7 @@
   <div id="overlay"></div>
   <button id="hud-back" onclick="stopAR()">← Back</button>
   <div id="hud-compass">↑ ---°</div>
+  <button id="hud-flip" onclick="flipCompass()">↔ Flip compass</button>
   <div id="hud-status">Acquiring GPS…</div>
 </div>
 
@@ -170,6 +178,10 @@ let stream   = null;
 let watchId  = null;
 let rafId    = null;
 let hasAbsoluteHeading = false; // true once we receive a reliable compass event
+let firstHeading = true;        // snap smoothHeading on the very first reading
+// Some Android devices report alpha CW-from-North; others report it CCW (per spec).
+// "Flip compass" toggles between the two. Preference is saved across sessions.
+let alphaFlipped = localStorage.getItem('compassFlip') === '1';
 
 const HFOV = 62;  // horizontal field of view (degrees) — typical wide-angle phone camera
 const VFOV = 48;  // vertical field of view (degrees) — portrait mode
@@ -283,8 +295,8 @@ async function startAR() {
   watchId = navigator.geolocation.watchPosition(
     pos => {
       userPos = { lat: pos.coords.latitude, lon: pos.coords.longitude };
-      document.getElementById('hud-status').textContent =
-        `GPS ±${Math.round(pos.coords.accuracy)}m`;
+      // Show GPS accuracy in the compass pill; render loop owns the status bar.
+      document.getElementById('hud-compass').dataset.gps = `±${Math.round(pos.coords.accuracy)}m`;
     },
     err => {
       document.getElementById('hud-status').textContent = 'GPS error: ' + err.message;
@@ -326,35 +338,45 @@ function stopAR() {
   window.removeEventListener('deviceorientationabsolute', onOrientationAbsolute, true);
   window.removeEventListener('deviceorientation',         onOrientationFallback,  true);
   stream = null; watchId = null; rafId = null; userPos = null;
-  hasAbsoluteHeading = false;
+  hasAbsoluteHeading = false; firstHeading = true;
   document.getElementById('ar').style.display    = 'none';
   document.getElementById('setup').style.display = 'flex';
 }
 
 // ── Orientation ────────────────────────────────────────────────────────────
-// Both webkitCompassHeading (iOS) and deviceorientationabsolute alpha (Chrome Android)
-// report compass heading as degrees CLOCKWISE from north (0=N, 90=E, 180=S, 270=W).
-// Do NOT invert alpha — the (360-alpha) formula mirrors the rotation and causes drift.
+function applyAlpha(alpha) {
+  // alpha from deviceorientationabsolute on Android: CW or CCW from North depends on device.
+  // "Flip compass" lets the user toggle between the two interpretations.
+  rawHeading = alphaFlipped ? (360 - alpha) % 360 : alpha;
+  if (firstHeading) { smoothHeading = rawHeading; firstHeading = false; }
+  hasAbsoluteHeading = true;
+}
+
+function flipCompass() {
+  alphaFlipped = !alphaFlipped;
+  localStorage.setItem('compassFlip', alphaFlipped ? '1' : '0');
+  // Snap smoothHeading immediately so the user sees the effect right away.
+  smoothHeading = rawHeading;
+}
 
 function onOrientationAbsolute(e) {
-  if (e.alpha == null) return;
-  hasAbsoluteHeading = true;
-  rawHeading = e.alpha; // Chrome Android: alpha is CW-from-north directly
   if (e.beta != null) pitch = e.beta - 90; // 0 = pointing at horizon, + = tilted down
+  if (e.alpha != null) applyAlpha(e.alpha);
 }
 
 function onOrientationFallback(e) {
-  if (hasAbsoluteHeading) return; // prefer deviceorientationabsolute when available
+  // Always update pitch, even after heading source is established.
+  if (e.beta != null) pitch = e.beta - 90;
+  if (hasAbsoluteHeading) return; // heading already handled by deviceorientationabsolute
   if (e.webkitCompassHeading != null) {
-    // iOS: direct CW-from-north compass heading
+    // iOS: webkitCompassHeading is always CW-from-North — no flip needed.
     rawHeading = e.webkitCompassHeading;
+    if (firstHeading) { smoothHeading = rawHeading; firstHeading = false; }
     hasAbsoluteHeading = true;
   } else if (e.absolute && e.alpha != null) {
-    rawHeading = e.alpha;
-    hasAbsoluteHeading = true;
+    applyAlpha(e.alpha);
   }
-  // Non-absolute alpha (relative to device start) is useless for AR — ignore it.
-  if (e.beta != null) pitch = e.beta - 90;
+  // Non-absolute alpha (relative to device start) is useless for AR — skip it.
 }
 
 // ── Render loop ────────────────────────────────────────────────────────────
@@ -370,9 +392,10 @@ function renderLoop() {
   smoothHeading = (smoothHeading + diff * 0.15 + 360) % 360;
 
   const compassEl = document.getElementById('hud-compass');
+  const gpsTag = compassEl.dataset.gps ? ` GPS${compassEl.dataset.gps}` : '';
   compassEl.textContent = hasAbsoluteHeading
-    ? `↑ ${Math.round(smoothHeading)}°`
-    : '↑ No compass';
+    ? `↑ ${Math.round(smoothHeading)}°${gpsTag}`
+    : `↑ No compass${gpsTag}`;
 
   let inRangeCount = 0;
 
