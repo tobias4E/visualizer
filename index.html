@@ -163,12 +163,13 @@
 // ── State ──────────────────────────────────────────────────────────────────
 let stations = JSON.parse(localStorage.getItem('stations') || '[]');
 let userPos  = null;
-let heading  = 0;   // compass bearing, degrees clockwise from north
+let rawHeading    = 0;  // latest compass reading (CW from north)
+let smoothHeading = 0;  // exponentially smoothed heading used for rendering
 let pitch    = 0;   // device tilt: 0 = pointing at horizon, + = looking down
 let stream   = null;
 let watchId  = null;
 let rafId    = null;
-let useAbsoluteOrientation = false;
+let hasAbsoluteHeading = false; // true once we receive a reliable compass event
 
 const HFOV = 62;  // horizontal field of view (degrees) — typical wide-angle phone camera
 const VFOV = 48;  // vertical field of view (degrees) — portrait mode
@@ -292,7 +293,7 @@ async function startAR() {
   );
 
   // Orientation events
-  useAbsoluteOrientation = false;
+  hasAbsoluteHeading = false;
   window.addEventListener('deviceorientationabsolute', onOrientationAbsolute, true);
   window.addEventListener('deviceorientation',         onOrientationFallback,  true);
 
@@ -325,30 +326,34 @@ function stopAR() {
   window.removeEventListener('deviceorientationabsolute', onOrientationAbsolute, true);
   window.removeEventListener('deviceorientation',         onOrientationFallback,  true);
   stream = null; watchId = null; rafId = null; userPos = null;
-  useAbsoluteOrientation = false;
+  hasAbsoluteHeading = false;
   document.getElementById('ar').style.display    = 'none';
   document.getElementById('setup').style.display = 'flex';
 }
 
 // ── Orientation ────────────────────────────────────────────────────────────
+// Both webkitCompassHeading (iOS) and deviceorientationabsolute alpha (Chrome Android)
+// report compass heading as degrees CLOCKWISE from north (0=N, 90=E, 180=S, 270=W).
+// Do NOT invert alpha — the (360-alpha) formula mirrors the rotation and causes drift.
+
 function onOrientationAbsolute(e) {
-  // Chrome on Android fires deviceorientationabsolute with an absolute compass.
-  // alpha = CCW rotation around Z from north  →  heading = (360 − alpha) % 360
   if (e.alpha == null) return;
-  useAbsoluteOrientation = true;
-  heading = (360 - e.alpha) % 360;
-  if (e.beta != null) pitch = e.beta - 90; // 0 = horizontal, + = tipped forward/down
+  hasAbsoluteHeading = true;
+  rawHeading = e.alpha; // Chrome Android: alpha is CW-from-north directly
+  if (e.beta != null) pitch = e.beta - 90; // 0 = pointing at horizon, + = tilted down
 }
 
 function onOrientationFallback(e) {
-  if (useAbsoluteOrientation) return; // already handled by absolute event
+  if (hasAbsoluteHeading) return; // prefer deviceorientationabsolute when available
   if (e.webkitCompassHeading != null) {
-    // iOS: webkitCompassHeading is a direct true-north bearing 0–360
-    heading = e.webkitCompassHeading;
+    // iOS: direct CW-from-north compass heading
+    rawHeading = e.webkitCompassHeading;
+    hasAbsoluteHeading = true;
   } else if (e.absolute && e.alpha != null) {
-    heading = (360 - e.alpha) % 360;
+    rawHeading = e.alpha;
+    hasAbsoluteHeading = true;
   }
-  // (non-absolute Android without webkitCompassHeading is unreliable; skip alpha)
+  // Non-absolute alpha (relative to device start) is useless for AR — ignore it.
   if (e.beta != null) pitch = e.beta - 90;
 }
 
@@ -357,28 +362,46 @@ function renderLoop() {
   rafId = requestAnimationFrame(renderLoop);
   if (!userPos) return;
 
-  const W = window.innerWidth;
-  const H = window.innerHeight;
+  // Smooth heading with circular exponential moving average to reduce compass jitter.
+  // Factor 0.15 = responsive but stable (~6–7 frames to settle).
+  let diff = rawHeading - smoothHeading;
+  if (diff >  180) diff -= 360;
+  if (diff < -180) diff += 360;
+  smoothHeading = (smoothHeading + diff * 0.15 + 360) % 360;
 
-  document.getElementById('hud-compass').textContent = `↑ ${Math.round(heading)}°`;
+  const compassEl = document.getElementById('hud-compass');
+  compassEl.textContent = hasAbsoluteHeading
+    ? `↑ ${Math.round(smoothHeading)}°`
+    : '↑ No compass';
+
+  let inRangeCount = 0;
 
   stations.forEach(s => {
     const marker  = document.getElementById(`m-${s.id}`);
     const distEl  = document.getElementById(`md-${s.id}`);
+    const edgeId  = `edge-${s.id}`;
+    let   edgeEl  = document.getElementById(edgeId);
     if (!marker) return;
 
+    const dist = getDistance(userPos, s);
+
+    // Only show stations within 100 m
+    if (dist > 100) {
+      marker.style.display = 'none';
+      if (edgeEl) edgeEl.style.display = 'none';
+      return;
+    }
+    inRangeCount++;
+
     const bearing = getBearing(userPos, s);
-    const dist    = getDistance(userPos, s);
 
-    // Horizontal: angle between target bearing and device heading (−180 to +180)
-    const relH = ((bearing - heading + 540) % 360) - 180;
+    // Horizontal: bearing relative to smoothed device heading (−180 to +180)
+    const relH = ((bearing - smoothHeading + 540) % 360) - 180;
 
-    // Vertical: ground-level elevation angle (negative = below horizon)
-    // For targets far away elevation ≈ 0; nearby targets are slightly below horizon
-    // We assume target is at roughly the same elevation as the user.
+    // Vertical: ground-level targets sit slightly below the horizon for nearby points.
+    // elevAngle < 0 means below horizon; for far targets it approaches 0.
     const elevAngle = dist > 5 ? -toDeg(Math.atan(1.5 / dist)) : -8;
-    // relV: positive = above camera center → lower yPct
-    const relV = elevAngle + pitch; // pitch > 0 = looking down → horizon moves up
+    const relV = elevAngle + pitch; // pitch > 0 = looking down → horizon rises in frame
 
     const xPct = 50 + (relH / (HFOV / 2)) * 50;
     const yPct = 50 - (relV / (VFOV / 2)) * 50;
@@ -390,28 +413,30 @@ function renderLoop() {
       marker.style.left    = `${xPct}%`;
       marker.style.top     = `${Math.max(8, Math.min(88, yPct))}%`;
       distEl.textContent   = fmtDist(dist);
+      if (edgeEl) edgeEl.style.display = 'none';
     } else {
       marker.style.display = 'none';
-    }
-
-    // Edge indicator (arrow pointing left or right toward off-screen target)
-    const edgeId = `edge-${s.id}`;
-    let edgeEl = document.getElementById(edgeId);
-    if (!inView) {
+      // Edge indicator pointing toward the off-screen station
       if (!edgeEl) {
         edgeEl = document.createElement('div');
         edgeEl.id = edgeId;
-        edgeEl.className = 'edge-indicator ' + (relH < 0 ? 'edge-left' : 'edge-right');
-        edgeEl.textContent = relH < 0 ? '‹' : '›';
         document.getElementById('overlay').appendChild(edgeEl);
       }
-      edgeEl.style.display = 'block';
-      edgeEl.className = 'edge-indicator ' + (relH < 0 ? 'edge-left' : 'edge-right');
+      edgeEl.className   = 'edge-indicator ' + (relH < 0 ? 'edge-left' : 'edge-right');
       edgeEl.textContent = relH < 0 ? '‹' : '›';
-    } else {
-      if (edgeEl) edgeEl.style.display = 'none';
+      edgeEl.style.display = 'block';
     }
   });
+
+  // Status line
+  const statusEl = document.getElementById('hud-status');
+  if (!hasAbsoluteHeading) {
+    statusEl.textContent = 'No compass — wave phone in a figure-8 to calibrate';
+  } else {
+    statusEl.textContent = inRangeCount === 0
+      ? 'No stations within 100 m'
+      : `${inRangeCount} station${inRangeCount > 1 ? 's' : ''} in range`;
+  }
 }
 
 // ── Init ───────────────────────────────────────────────────────────────────
