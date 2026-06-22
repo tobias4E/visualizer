@@ -1,0 +1,23 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Training outputs (large binary files)
+runs/
+yolov8n.pt
+*.pt
+
+# Private dataset — images and labels stay local
+training/dataset/images/
+training/dataset/labels/
+training/dataset/golden_data/
+training/dataset/golden_data_labels_backup/
+
+# Docker
+cvat/
+
+# uv
+.python-version
+uv.lock

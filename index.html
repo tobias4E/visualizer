@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
   <title>AR Charging Stations</title>
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.19.2/dist/ort.min.js"></script>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #0d1117; color: #e6edf3; height: 100dvh; overflow: hidden; }
@@ -131,6 +132,21 @@
       max-height: 55vh; overflow-y: auto;
     }
 
+    #hud-cv {
+      position: absolute; bottom: 44px; left: 0; right: 0;
+      text-align: center; font-size: 11px; pointer-events: none;
+      color: rgba(255,200,0,0.85);
+      text-shadow: 0 1px 3px rgba(0,0,0,0.9);
+    }
+    /* Arrow turns green when CV has locked onto a detected object */
+    .marker.cv-locked .m-arrow {
+      border-top-color: #2ecc71;
+      filter: drop-shadow(0 0 8px rgba(46,204,113,0.9));
+    }
+    .marker.cv-locked .m-name {
+      border: 1px solid rgba(46,204,113,0.7);
+    }
+
     /* Off-screen edge arrows */
     .edge-indicator {
       position: absolute; top: 50%; transform: translateY(-50%);
@@ -181,11 +197,14 @@
 <div id="ar">
   <video id="video" autoplay playsinline muted></video>
   <div id="overlay"></div>
+  <!-- Hidden canvas used for running TF.js inference on the camera frame -->
+  <canvas id="inf-canvas" style="display:none"></canvas>
   <button id="hud-back" onclick="stopAR()">← Back</button>
   <div id="hud-compass">↑ ---°</div>
   <button id="hud-flip" onclick="flipCompass()">↔ Flip compass</button>
   <button id="hud-debug-btn" onclick="toggleDebug()">🔍 Debug</button>
   <div id="debug-panel"></div>
+  <div id="hud-cv"></div>
   <div id="hud-status">Acquiring GPS…</div>
 </div>
 
@@ -216,6 +235,16 @@ let dbg = {
   fallCount:  0,       // deviceorientation count
 };
 let debugVisible = false;
+
+// ── CV / TensorFlow.js state ───────────────────────────────────────────────
+let tfModel     = null;   // loaded TF.js model (kept alive across AR sessions)
+let cvActive    = false;  // detection loop running flag
+// Map<stationId, {sx, sy, score, label} | null>
+// sx/sy = screen-space pixel coords of the best-matching detection
+const cvDetections = new Map();
+
+// Inference canvas dimensions — portrait 3:4 at reduced res for speed
+const INF_W = 320;
 
 const HFOV = 80;  // horizontal field of view (degrees) — wider margin for compass error
 const VFOV = 60;  // vertical field of view (degrees) — portrait mode
@@ -366,6 +395,27 @@ async function startAR() {
   document.getElementById('ar').style.display    = 'block';
 
   rafId = requestAnimationFrame(renderLoop);
+
+  // Load TF model asynchronously — AR is already usable (GPS mode) while this runs.
+  // The model is kept in memory across sessions so it only loads once.
+  cvActive = true;
+  if (tfModel) {
+    // Already loaded from a previous session
+    document.getElementById('hud-cv').textContent = 'CV: ready';
+    runDetectionLoop();
+  } else {
+    document.getElementById('hud-cv').textContent = 'CV: loading model…';
+    ort.InferenceSession.create('./model/best.onnx', { executionProviders: ['wasm'] })
+      .then(session => {
+        tfModel = makeOrtWrapper(session, ['charger']);
+        document.getElementById('hud-cv').textContent = 'CV: model ready';
+        if (cvActive) runDetectionLoop();
+      })
+      .catch(err => {
+        document.getElementById('hud-cv').textContent = 'CV: failed to load';
+        console.warn('ONNX model load failed:', err);
+      });
+  }
 }
 
 function stopAR() {
@@ -376,6 +426,9 @@ function stopAR() {
   window.removeEventListener('deviceorientation',         onOrientationFallback,  true);
   stream = null; watchId = null; rafId = null; userPos = null;
   hasAbsoluteHeading = false; firstHeading = true;
+  cvActive = false;
+  cvDetections.clear();
+  document.getElementById('hud-cv').textContent = '';
   document.getElementById('ar').style.display    = 'none';
   document.getElementById('setup').style.display = 'flex';
 }
@@ -429,6 +482,93 @@ function onOrientationFallback(e) {
     dbg.source   = `deviceorientation[absolute=${e.absolute}, alpha=${e.alpha != null}]`;
     dbg.rawAlpha = e.alpha;
   }
+}
+
+// ── CV detection loop ──────────────────────────────────────────────────────
+async function runDetectionLoop() {
+  if (!cvActive) return;
+
+  const video  = document.getElementById('video');
+  const canvas = document.getElementById('inf-canvas');
+  const ctx    = canvas.getContext('2d');
+
+  // Wait until video has real dimensions (might not be ready immediately)
+  if (!video.videoWidth) {
+    setTimeout(runDetectionLoop, 500);
+    return;
+  }
+
+  // Size the inference canvas to match screen aspect ratio at low resolution.
+  // This replicates object-fit:cover so prediction coords map directly to screen %.
+  const W = window.innerWidth, H = window.innerHeight;
+  const INF_H = Math.round(INF_W * H / W);
+  if (canvas.width !== INF_W || canvas.height !== INF_H) {
+    canvas.width = INF_W; canvas.height = INF_H;
+  }
+
+  // Draw only the visible crop of the video (mirrors CSS object-fit:cover).
+  const vW = video.videoWidth, vH = video.videoHeight;
+  const screenAR = W / H, videoAR = vW / vH;
+  let sx, sy, sw, sh;
+  if (videoAR > screenAR) {
+    sh = vH; sw = sh * screenAR; sx = (vW - sw) / 2; sy = 0;
+  } else {
+    sw = vW; sh = sw / screenAR; sx = 0; sy = (vH - sh) / 2;
+  }
+  ctx.drawImage(video, sx, sy, sw, sh, 0, 0, INF_W, INF_H);
+
+  let preds = [];
+  try {
+    preds = await tfModel.detect(canvas);
+  } catch (e) {
+    console.warn('TF detect error:', e);
+    setTimeout(runDetectionLoop, 1000);
+    return;
+  }
+
+  // Scale bounding boxes from inference canvas space → screen pixels
+  const scaled = preds
+    .filter(p => p.score >= 0.25)
+    .map(p => ({
+      label : p.class,
+      score : p.score,
+      sx    : ((p.bbox[0] + p.bbox[2] / 2) / INF_W) * W,  // center x
+      sy    : ((p.bbox[1] + p.bbox[3] / 2) / INF_H) * H,  // center y
+    }));
+
+  // For each in-view station, snap to the closest detection within a generous
+  // threshold (GPS ±15 m error translates to ~40% of screen at 30 m range).
+  const snapPx = Math.min(W, H) * 0.45;
+  stations.forEach(s => {
+    const marker = document.getElementById(`m-${s.id}`);
+    if (!marker || marker.style.display === 'none') {
+      cvDetections.set(s.id, null);
+      return;
+    }
+    const gpsX = parseFloat(marker.style.left)  / 100 * W;
+    const gpsY = parseFloat(marker.style.top)   / 100 * H;
+
+    let best = null, bestDist = snapPx;
+    scaled.forEach(p => {
+      const d = Math.hypot(p.sx - gpsX, p.sy - gpsY);
+      if (d < bestDist) { bestDist = d; best = p; }
+    });
+    cvDetections.set(s.id, best);
+  });
+
+  // Update CV status pill
+  const locked = [...cvDetections.values()].filter(Boolean).length;
+  const cvEl = document.getElementById('hud-cv');
+  if (scaled.length === 0) {
+    cvEl.textContent = 'CV: scanning…';
+  } else {
+    cvEl.textContent = locked
+      ? `CV: locked (${scaled.length} obj, ${locked} matched)`
+      : `CV: ${scaled.length} obj — none near GPS pos`;
+  }
+
+  // ~3 FPS — enough to track a slowly moving user without draining the battery
+  setTimeout(runDetectionLoop, 333);
 }
 
 // ── Render loop ────────────────────────────────────────────────────────────
@@ -501,23 +641,36 @@ function renderLoop() {
       `  "${s.name}": dist=${Math.round(dist)}m bear=${Math.round(bearing)}° relH=${relH > 0 ? '+' : ''}${Math.round(relH)}° elev=${elev.toFixed(1)}° h=${(s.height ?? 1.0).toFixed(1)}m → ${visLabel}`
     );
 
-    if (inView) {
+    // Always write GPS-projected position so runDetectionLoop can match YOLO detections
+    marker.style.left = `${xPct}%`;
+    marker.style.top  = `${Math.max(8, Math.min(88, yPct))}%`;
+
+    const cvDet = cvDetections.get(s.id);
+    if (cvDet) {
+      // YOLO confirmed: show arrow snapped to detection box
       marker.style.display = 'flex';
-      marker.style.left    = `${xPct}%`;
-      marker.style.top     = `${Math.max(8, Math.min(88, yPct))}%`;
-      distEl.textContent   = fmtDist(dist);
+      marker.style.left = `${(cvDet.sx / window.innerWidth)  * 100}%`;
+      marker.style.top  = `${(cvDet.sy / window.innerHeight) * 100}%`;
+      distEl.textContent = `${fmtDist(dist)} · ${Math.round(cvDet.score * 100)}%`;
+      marker.classList.add('cv-locked');
       if (edgeEl) edgeEl.style.display = 'none';
     } else {
+      // No YOLO detection: hide arrow
       marker.style.display = 'none';
-      // Edge indicator pointing toward the off-screen station
-      if (!edgeEl) {
-        edgeEl = document.createElement('div');
-        edgeEl.id = edgeId;
-        document.getElementById('overlay').appendChild(edgeEl);
+      marker.classList.remove('cv-locked');
+      // Edge indicator: GPS-driven so user knows where to point the camera
+      if (!inView) {
+        if (!edgeEl) {
+          edgeEl = document.createElement('div');
+          edgeEl.id = edgeId;
+          document.getElementById('overlay').appendChild(edgeEl);
+        }
+        edgeEl.className   = 'edge-indicator ' + (relH < 0 ? 'edge-left' : 'edge-right');
+        edgeEl.textContent = relH < 0 ? '‹' : '›';
+        edgeEl.style.display = 'block';
+      } else {
+        if (edgeEl) edgeEl.style.display = 'none';
       }
-      edgeEl.className   = 'edge-indicator ' + (relH < 0 ? 'edge-left' : 'edge-right');
-      edgeEl.textContent = relH < 0 ? '‹' : '›';
-      edgeEl.style.display = 'block';
     }
   });
 
@@ -551,14 +704,80 @@ ${stationDebugLines.join('\n') || '  (none in range)'}`;
   }
 
   // Status line
+  const detectedCount = [...cvDetections.values()].filter(Boolean).length;
   const statusEl = document.getElementById('hud-status');
   if (!hasAbsoluteHeading) {
     statusEl.textContent = 'No compass — wave phone in a figure-8 to calibrate';
+  } else if (inRangeCount === 0) {
+    statusEl.textContent = 'No stations within 100 m';
+  } else if (detectedCount > 0) {
+    statusEl.textContent = `${detectedCount} charger${detectedCount > 1 ? 's' : ''} detected`;
   } else {
-    statusEl.textContent = inRangeCount === 0
-      ? 'No stations within 100 m'
-      : `${inRangeCount} station${inRangeCount > 1 ? 's' : ''} in range`;
+    statusEl.textContent = `${inRangeCount} station${inRangeCount > 1 ? 's' : ''} in range — point camera at charger`;
   }
+}
+
+// ── YOLOv8 ONNX wrapper (onnxruntime-web) ─────────────────────────────────
+function makeOrtWrapper(session, classNames) {
+  return {
+    async detect(canvas) {
+      const SIZE = 320;
+
+      // Resize canvas to 320×320 and extract RGB pixels in CHW float32 format
+      const tmp = document.createElement('canvas');
+      tmp.width = SIZE; tmp.height = SIZE;
+      tmp.getContext('2d').drawImage(canvas, 0, 0, SIZE, SIZE);
+      const px = tmp.getContext('2d').getImageData(0, 0, SIZE, SIZE).data;
+      const input = new Float32Array(3 * SIZE * SIZE);
+      for (let i = 0; i < SIZE * SIZE; i++) {
+        input[i]               = px[i * 4]     / 255.0; // R
+        input[i + SIZE * SIZE]   = px[i * 4 + 1] / 255.0; // G
+        input[i + 2 * SIZE * SIZE] = px[i * 4 + 2] / 255.0; // B
+      }
+
+      const tensor  = new ort.Tensor('float32', input, [1, 3, SIZE, SIZE]);
+      const results = await session.run({ images: tensor });
+      // output0 shape: [1, 4+nc, numAnchors] — for nc=1 at 320px: [1, 5, 2100]
+      const data    = results['output0'].data;
+      const numDet  = results['output0'].dims[2];
+
+      const boxes = [];
+      for (let i = 0; i < numDet; i++) {
+        let maxConf = 0, maxCls = 0;
+        for (let c = 0; c < classNames.length; c++) {
+          const conf = data[(4 + c) * numDet + i];
+          if (conf > maxConf) { maxConf = conf; maxCls = c; }
+        }
+        if (maxConf < 0.25) continue;
+        const cx = data[0 * numDet + i] / SIZE * canvas.width;
+        const cy = data[1 * numDet + i] / SIZE * canvas.height;
+        const bw = data[2 * numDet + i] / SIZE * canvas.width;
+        const bh = data[3 * numDet + i] / SIZE * canvas.height;
+        boxes.push({ class: classNames[maxCls], score: maxConf, bbox: [cx - bw / 2, cy - bh / 2, bw, bh] });
+      }
+      return nms(boxes, 0.45);
+    }
+  };
+}
+
+function nms(boxes, iouThreshold) {
+  boxes.sort((a, b) => b.score - a.score);
+  const kept = [], suppressed = new Set();
+  for (let i = 0; i < boxes.length; i++) {
+    if (suppressed.has(i)) continue;
+    kept.push(boxes[i]);
+    for (let j = i + 1; j < boxes.length; j++) {
+      if (iou(boxes[i].bbox, boxes[j].bbox) > iouThreshold) suppressed.add(j);
+    }
+  }
+  return kept;
+}
+
+function iou([x1,y1,w1,h1], [x2,y2,w2,h2]) {
+  const ix = Math.max(0, Math.min(x1+w1, x2+w2) - Math.max(x1, x2));
+  const iy = Math.max(0, Math.min(y1+h1, y2+h2) - Math.max(y1, y2));
+  const inter = ix * iy;
+  return inter / (w1*h1 + w2*h2 - inter + 1e-6);
 }
 
 // ── Init ───────────────────────────────────────────────────────────────────

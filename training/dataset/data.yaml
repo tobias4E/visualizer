@@ -1,0 +1,7 @@
+path: /mnt/c/Users/TobiasGerlach/Documents/Code/augmented_charging_marking/training/dataset
+train: images/train
+val: images/val
+test: images/test
+
+nc: 1
+names: ['charger']
