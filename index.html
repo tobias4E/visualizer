@@ -32,10 +32,18 @@
     .btn-del  { background: transparent; color: #8b949e; border: none; font-size: 18px; padding: 4px 8px; cursor: pointer; line-height: 1; }
     .btn-del:active { color: #f85149; }
 
-    .station-item { background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 10px 12px; display: flex; align-items: center; gap: 8px; }
+    .station-group { border: 1px solid #21262d; border-radius: 8px; overflow: hidden; }
+    .station-item { background: #0d1117; padding: 10px 12px; display: flex; align-items: center; gap: 8px; }
     .station-item .info { flex: 1; }
     .station-item .sname { font-weight: 600; font-size: 15px; }
     .station-item .scoords { font-size: 12px; color: #8b949e; margin-top: 2px; font-variant-numeric: tabular-nums; }
+    .btn-child-add { background: transparent; color: #f0883e; border: 1px solid rgba(240,136,62,0.4); border-radius: 20px; font-size: 12px; font-weight: 700; padding: 3px 9px; cursor: pointer; line-height: 1; flex-shrink: 0; }
+    .btn-child-add:active { opacity: 0.7; }
+    .child-add-form { background: #0d1117; border-top: 1px solid #21262d; padding: 10px 12px; display: none; flex-direction: column; gap: 6px; }
+    .child-item { background: #0a0e13; border-top: 1px solid #21262d; padding: 8px 10px 8px 20px; display: flex; align-items: center; gap: 8px; }
+    .child-item .info { flex: 1; }
+    .child-item .sname { font-weight: 600; font-size: 13px; color: #f0883e; }
+    .child-item .scoords { font-size: 11px; color: #8b949e; margin-top: 2px; font-variant-numeric: tabular-nums; }
 
     #station-list { display: flex; flex-direction: column; gap: 6px; }
     .empty-hint { text-align: center; color: #484f58; font-size: 14px; padding: 20px 0; }
@@ -147,6 +155,11 @@
     .marker.cv-locked .m-name {
       border: 1px solid rgba(46,204,113,0.7);
     }
+
+    /* Child markers (parking spaces) — shown only when parent is CV-confirmed */
+    .child-marker .m-name { font-size: 11px; border: 1px solid rgba(240,136,62,0.6); max-width: 140px; }
+    .child-marker .m-dist { color: #f0883e; }
+    .child-marker .m-arrow { border-left-width: 10px; border-right-width: 10px; border-top: 16px solid #f0883e; filter: drop-shadow(0 0 6px rgba(240,136,62,0.8)); animation: none; }
 
     /* Off-screen edge arrows */
     .edge-indicator {
@@ -293,7 +306,7 @@ function addStation() {
   if (isNaN(lat) || lat < -90 || lat > 90)   return alert('Latitude must be between −90 and 90.');
   if (isNaN(lon) || lon < -180 || lon > 180) return alert('Longitude must be between −180 and 180.');
 
-  stations.push({ id: Date.now(), name, lat, lon, height });
+  stations.push({ id: Date.now(), name, lat, lon, height, children: [] });
   saveStations();
   document.getElementById('inp-name').value   = '';
   document.getElementById('inp-lat').value    = '';
@@ -309,20 +322,82 @@ function removeStation(id) {
   renderList();
 }
 
+function toggleChildForm(parentId) {
+  const form = document.getElementById(`child-form-${parentId}`);
+  if (!form) return;
+  const open = getComputedStyle(form).display !== 'none';
+  form.style.display = open ? 'none' : 'flex';
+}
+
+function addChild(parentId) {
+  const parent = stations.find(s => s.id === parentId);
+  if (!parent) return;
+  const name   = document.getElementById(`ci-name-${parentId}`).value.trim();
+  const lat    = parseFloat(document.getElementById(`ci-lat-${parentId}`).value);
+  const lon    = parseFloat(document.getElementById(`ci-lon-${parentId}`).value);
+  const hRaw   = parseFloat(document.getElementById(`ci-h-${parentId}`).value);
+  const height = isNaN(hRaw) ? 0.5 : Math.max(0, hRaw);
+
+  if (!name)                                   return alert('Please enter a name for the parking space.');
+  if (isNaN(lat) || lat < -90  || lat > 90)   return alert('Latitude must be between −90 and 90.');
+  if (isNaN(lon) || lon < -180 || lon > 180)  return alert('Longitude must be between −180 and 180.');
+
+  if (!parent.children) parent.children = [];
+  parent.children.push({ id: Date.now(), name, lat, lon, height });
+  saveStations();
+  renderList();
+}
+
+function removeChild(parentId, childId) {
+  const parent = stations.find(s => s.id === parentId);
+  if (!parent || !parent.children) return;
+  parent.children = parent.children.filter(c => c.id !== childId);
+  saveStations();
+  renderList();
+}
+
 function renderList() {
   const list = document.getElementById('station-list');
   if (stations.length === 0) {
     list.innerHTML = '<p class="empty-hint">No stations yet — add one above.</p>';
   } else {
-    list.innerHTML = stations.map(s => `
-      <div class="station-item">
-        <div class="info">
-          <div class="sname">${escHtml(s.name)}</div>
-          <div class="scoords">${s.lat.toFixed(6)}, ${s.lon.toFixed(6)} · ${(s.height ?? 1.0).toFixed(1)} m</div>
+    list.innerHTML = stations.map(s => {
+      const children = s.children || [];
+      const childrenHtml = children.map(c => `
+        <div class="child-item">
+          <div class="info">
+            <div class="sname">[P] ${escHtml(c.name)}</div>
+            <div class="scoords">${c.lat.toFixed(6)}, ${c.lon.toFixed(6)} · ${(c.height ?? 0.5).toFixed(1)} m</div>
+          </div>
+          <button class="btn-del" onclick="removeChild(${s.id}, ${c.id})" title="Remove">✕</button>
         </div>
-        <button class="btn-del" onclick="removeStation(${s.id})" title="Remove">✕</button>
-      </div>
-    `).join('');
+      `).join('');
+      return `
+        <div class="station-group">
+          <div class="station-item">
+            <div class="info">
+              <div class="sname">${escHtml(s.name)}</div>
+              <div class="scoords">${s.lat.toFixed(6)}, ${s.lon.toFixed(6)} · ${(s.height ?? 1.0).toFixed(1)} m</div>
+            </div>
+            <button class="btn-child-add" onclick="toggleChildForm(${s.id})" title="Add parking space">+P</button>
+            <button class="btn-del" onclick="removeStation(${s.id})" title="Remove">✕</button>
+          </div>
+          ${childrenHtml}
+          <div id="child-form-${s.id}" class="child-add-form">
+            <label>Parking space name</label>
+            <input id="ci-name-${s.id}" placeholder="e.g. Space A1" type="text" enterkeyhint="next">
+            <label>Coordinates (WGS84)</label>
+            <div class="row">
+              <input id="ci-lat-${s.id}" placeholder="Latitude" type="number" step="any" enterkeyhint="next">
+              <input id="ci-lon-${s.id}" placeholder="Longitude" type="number" step="any" enterkeyhint="next">
+            </div>
+            <label>Height (m) — optional</label>
+            <input id="ci-h-${s.id}" placeholder="Height in m (default 0.5)" type="number" step="0.1" min="0" max="50" enterkeyhint="done">
+            <button class="btn btn-add" onclick="addChild(${s.id})">+ Add parking space</button>
+          </div>
+        </div>
+      `;
+    }).join('');
   }
   document.getElementById('btn-start').disabled = stations.length === 0;
 }
@@ -393,6 +468,19 @@ async function startAR() {
     `;
     el.style.display = 'none';
     overlay.appendChild(el);
+
+    (s.children || []).forEach(c => {
+      const cel = document.createElement('div');
+      cel.className = 'marker child-marker';
+      cel.id = `m-${c.id}`;
+      cel.innerHTML = `
+        <div class="m-name">${escHtml(c.name)}</div>
+        <div class="m-dist" id="md-${c.id}"></div>
+        <div class="m-arrow"></div>
+      `;
+      cel.style.display = 'none';
+      overlay.appendChild(cel);
+    });
   });
 
   document.getElementById('setup').style.display = 'none';
@@ -690,6 +778,30 @@ function renderLoop() {
         if (edgeEl) edgeEl.style.display = 'none';
       }
     }
+
+    // Child markers (parking spaces) — only visible when this parent is confirmed
+    const parentConfirmed = !!(cvDet || isConfirmed);
+    (s.children || []).forEach(c => {
+      const cm = document.getElementById(`m-${c.id}`);
+      if (!cm) return;
+      if (!parentConfirmed) { cm.style.display = 'none'; return; }
+
+      const cDist  = getDistance(userPos, c);
+      const cBear  = getBearing(userPos, c);
+      const cRelH  = ((cBear - smoothHeading + 540) % 360) - 180;
+      const cElev  = -toDeg(Math.atan2(EYE_HEIGHT - (c.height ?? 0.5), Math.max(cDist, 0.5)));
+      const cXPct  = 50 + (cRelH / (HFOV / 2)) * 50;
+      const cYPct  = 50 - (cElev  / (VFOV / 2)) * 50;
+
+      cm.style.left = `${cXPct}%`;
+      cm.style.top  = `${Math.max(8, Math.min(88, cYPct))}%`;
+      if (Math.abs(cRelH) < HFOV / 2) {
+        cm.style.display = 'flex';
+        document.getElementById(`md-${c.id}`).textContent = fmtDist(cDist);
+      } else {
+        cm.style.display = 'none';
+      }
+    });
   });
 
   // Debug panel
