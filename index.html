@@ -236,12 +236,14 @@ let dbg = {
 };
 let debugVisible = false;
 
-// ── CV / TensorFlow.js state ───────────────────────────────────────────────
-let tfModel     = null;   // loaded TF.js model (kept alive across AR sessions)
+// ── CV / ONNX state ───────────────────────────────────────────────────────
+let tfModel     = null;   // loaded ONNX session wrapper (kept alive across AR sessions)
 let cvActive    = false;  // detection loop running flag
-// Map<stationId, {sx, sy, score, label} | null>
-// sx/sy = screen-space pixel coords of the best-matching detection
+// Map<stationId, {sx, sy, score, label} | null> — latest YOLO hit per station
 const cvDetections = new Map();
+// Map<stationId, timestamp> — last time YOLO confirmed this station
+const confirmedStations = new Map();
+const CONFIRM_TIMEOUT_MS = 5000; // keep arrow alive for 5 s after last YOLO hit
 
 // Inference canvas dimensions — portrait 3:4 at reduced res for speed
 const INF_W = 320;
@@ -428,6 +430,7 @@ function stopAR() {
   hasAbsoluteHeading = false; firstHeading = true;
   cvActive = false;
   cvDetections.clear();
+  confirmedStations.clear();
   document.getElementById('hud-cv').textContent = '';
   document.getElementById('ar').style.display    = 'none';
   document.getElementById('setup').style.display = 'flex';
@@ -541,12 +544,14 @@ async function runDetectionLoop() {
   const snapPx = Math.min(W, H) * 0.45;
   stations.forEach(s => {
     const marker = document.getElementById(`m-${s.id}`);
-    if (!marker || marker.style.display === 'none') {
+    // Always attempt matching using the GPS-projected position written by renderLoop,
+    // even when the marker is hidden — this is how the first confirmation is triggered.
+    if (!marker || !marker.style.left) {
       cvDetections.set(s.id, null);
       return;
     }
-    const gpsX = parseFloat(marker.style.left)  / 100 * W;
-    const gpsY = parseFloat(marker.style.top)   / 100 * H;
+    const gpsX = parseFloat(marker.style.left) / 100 * W;
+    const gpsY = parseFloat(marker.style.top)  / 100 * H;
 
     let best = null, bestDist = snapPx;
     scaled.forEach(p => {
@@ -554,6 +559,7 @@ async function runDetectionLoop() {
       if (d < bestDist) { bestDist = d; best = p; }
     });
     cvDetections.set(s.id, best);
+    if (best) confirmedStations.set(s.id, Date.now());
   });
 
   // Update CV status pill
@@ -645,20 +651,30 @@ function renderLoop() {
     marker.style.left = `${xPct}%`;
     marker.style.top  = `${Math.max(8, Math.min(88, yPct))}%`;
 
-    const cvDet = cvDetections.get(s.id);
+    const cvDet      = cvDetections.get(s.id);
+    const lastYolo   = confirmedStations.get(s.id) ?? 0;
+    const isConfirmed = (Date.now() - lastYolo) < CONFIRM_TIMEOUT_MS;
+
     if (cvDet) {
-      // YOLO confirmed: show arrow snapped to detection box
+      // Active YOLO hit: snap arrow to detection center
       marker.style.display = 'flex';
       marker.style.left = `${(cvDet.sx / window.innerWidth)  * 100}%`;
       marker.style.top  = `${(cvDet.sy / window.innerHeight) * 100}%`;
       distEl.textContent = `${fmtDist(dist)} · ${Math.round(cvDet.score * 100)}%`;
       marker.classList.add('cv-locked');
       if (edgeEl) edgeEl.style.display = 'none';
+    } else if (isConfirmed && inView) {
+      // YOLO not active this frame but station was recently confirmed:
+      // hold arrow at GPS-projected position — moves spatially with the camera.
+      marker.style.display = 'flex';
+      // left/top already set to GPS projection above — no override needed
+      distEl.textContent = fmtDist(dist);
+      marker.classList.add('cv-locked');
+      if (edgeEl) edgeEl.style.display = 'none';
     } else {
-      // No YOLO detection: hide arrow
+      // Not confirmed (or timed out): hide arrow
       marker.style.display = 'none';
       marker.classList.remove('cv-locked');
-      // Edge indicator: GPS-driven so user knows where to point the camera
       if (!inView) {
         if (!edgeEl) {
           edgeEl = document.createElement('div');
